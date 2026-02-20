@@ -305,7 +305,13 @@ h2 { margin: 16px 0 8px 0; font-size: 1.1rem; }
 small { color: #666; }
 input[type=text] { width: 20em; }
 ul.tree, ul.tree ul { list-style: none; padding-left: 1em; border-left: 1px dotted #ccc; }
-li.task { margin: 4px 0; padding-left: .3em; }
+li.task {
+  margin: 4px 0;
+  padding-left: .3em;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 
 .badge {
   display:inline-block;
@@ -462,7 +468,8 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
                 期日: {{ t['due_date'] }}
               </span>
 
-                <form style="display:inline;" method="post" action="{{ url_for('update_meta', task_id=t['id']) }}">
+                <form style="display:inline-flex; align-items:center; gap:4px;" method="post" action="{{ url_for('update_meta', task_id=t['id']) }}">
+           
                   <select name="tag">
                     {% for tg in tags %}
                       <option value="{{ tg }}" {% if tg == t['tag'] %}selected{% endif %}>{{ tg }}</option>
