@@ -305,13 +305,42 @@ h2 { margin: 16px 0 8px 0; font-size: 1.1rem; }
 small { color: #666; }
 input[type=text] { width: 20em; }
 ul.tree, ul.tree ul { list-style: none; padding-left: 1em; border-left: 1px dotted #ccc; }
-li.task {
-  margin: 4px 0;
-  padding-left: .3em;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+li.task { margin: 4px 0; padding-left: .3em; }
+
+/* 1タスクの“1行表示”はこの箱（task-row）だけに適用する */
+.task-row{
+  display:flex;
+  align-items:center;
+  gap:6px;
 }
+
+/* タスク名は省略（…）して、ホバーで全文（title属性） */
+.task-title{
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* バッジ類は縦に崩れないようにする */
+.task-row .badge{
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ✎編集リンクをボタン風に */
+a.btn-edit{
+  flex: 0 0 auto;
+  display:inline-block;
+  padding:2px 6px;
+  border:1px solid #bbb;
+  border-radius:4px;
+  text-decoration:none;
+  color:#333;
+  background:#fff;
+}
+a.btn-edit:hover{ background:#f2f2f2; }
 
 .badge {
   display:inline-block;
@@ -443,60 +472,46 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
       <ul class="tree">
         {% macro render_children(pid) %}
           {% for t in children_by_parent.get(pid, []) %}
-            <li class="task">
-              <form style="display:inline;" method="post" action="{{ url_for('complete', task_id=t['id']) }}">
-                <button title="完了">✔</button>
-              </form>
-              <form style="display:inline;" method="post"
-                    action="{{ url_for('delete', task_id=t['id']) }}"
-                    onsubmit="return confirm('このタスクを削除しますか？');">
-                <button title="削除">✖</button>
-              </form>
-              <strong>{{ t['title'] }}</strong>
-
-              <span class="badge badge-tag">{{ t['tag'] }}</span>
-
-              {% set score_class =
-                  'badge-score-max' if t['score'] == 100
-                  else ('badge-score-high' if t['score'] >= 80
-                  else ('badge-score-mid' if t['score'] >= 50
-                  else 'badge-score-low'))
-              %}
-              <span class="badge {{ score_class }}">点: {{ t['score'] }}</span>
-
-              <span class="badge {% if t['is_overdue'] %}badge-overdue{% endif %}">
-                期日: {{ t['due_date'] }}
-              </span>
-
-                <form style="display:inline-flex; align-items:center; gap:4px;" method="post" action="{{ url_for('update_meta', task_id=t['id']) }}">
-           
-                  <select name="tag">
-                    {% for tg in tags %}
-                      <option value="{{ tg }}" {% if tg == t['tag'] %}selected{% endif %}>{{ tg }}</option>
-                    {% endfor %}
-                  </select>
-                
-                  <select name="parent_id">
-                    <option value="" {% if not t['parent_id_effective'] %}selected{% endif %}>なし</option>
-                    {% for rt in selectable_parents %}
-                      {% if rt['id'] not in t['forbidden_parent_ids'] %}
-                        <option value="{{ rt['id'] }}" {% if rt['id_str'] == t['parent_id_effective'] %}selected{% endif %}>
-                          {{ rt['title'] }}
-                        </option>
-                      {% endif %}
-                    {% endfor %}
-                  </select>
-                
-                  <button title="タグ/親を更新">更新</button>
-                </form>
-
-              {% if t['recur'] != 'none' %}
-                <span class="badge">定期: {{ '毎週' if t['recur']=='weekly' else '毎月' }}</span>
-              {% endif %}
-              <ul>
-                {{ render_children(t['id_str']) }}
-              </ul>
-            </li>
+         <li class="task">
+          <div class="task-row">
+            <form style="display:inline;" method="post" action="{{ url_for('complete', task_id=t['id']) }}">
+              <button title="完了">✔</button>
+            </form>
+        
+            <form style="display:inline;" method="post"
+                  action="{{ url_for('delete', task_id=t['id']) }}"
+                  onsubmit="return confirm('このタスクを削除しますか？');">
+              <button title="削除">✖</button>
+            </form>
+        
+            <strong class="task-title" title="{{ t['title'] }}">{{ t['title'] }}</strong>
+        
+            <span class="badge badge-tag">{{ t['tag'] }}</span>
+        
+            {% set score_class =
+                'badge-score-max' if t['score'] == 100
+                else ('badge-score-high' if t['score'] >= 80
+                else ('badge-score-mid' if t['score'] >= 50
+                else 'badge-score-low'))
+            %}
+            <span class="badge {{ score_class }}">点: {{ t['score'] }}</span>
+        
+            <span class="badge {% if t['is_overdue'] %}badge-overdue{% endif %}">
+              期日: {{ t['due_date'] }}
+            </span>
+        
+            {% if t['recur'] != 'none' %}
+              <span class="badge">定期: {{ '毎週' if t['recur']=='weekly' else '毎月' }}</span>
+            {% endif %}
+        
+            <a class="btn-edit" href="{{ url_for('edit_task', task_id=t['id']) }}" title="タグ/親タスクを編集">✎</a>
+          </div>
+        
+          <ul>
+            {{ render_children(t['id_str']) }}
+          </ul>
+        </li>
+            
           {% endfor %}
         {% endmacro %}
         {{ render_children('') }}
@@ -623,7 +638,47 @@ form { display:inline-block; margin-right:8px; }
 
 <div><a href="{{ url_for('index') }}">戻る</a></div>
 """
+EDIT_HTML = r"""
+<!doctype html>
+<meta charset="utf-8">
+<title>タスク編集</title>
+<style>
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; margin: 20px; }
+.card { border:1px solid #ddd; border-radius:8px; padding:12px; max-width: 900px; }
+.form-inline > * { margin-right: 10px; }
+</style>
 
+<h1>タスク編集</h1>
+
+<section class="card">
+  <div style="margin-bottom:10px;">
+    <strong>{{ task['title'] }}</strong>
+  </div>
+
+  <form method="post">
+    <div class="form-inline">
+      <label>タグ</label>
+      <select name="tag">
+        {% for tg in tags %}
+          <option value="{{ tg }}" {% if tg == task['tag'] %}selected{% endif %}>{{ tg }}</option>
+        {% endfor %}
+      </select>
+
+      <label>親タスク</label>
+      <select name="parent_id">
+        <option value="" {% if current_parent_id is none %}selected{% endif %}>なし</option>
+        {% for p in parent_candidates %}
+          <option value="{{ p['id'] }}" {% if current_parent_id == p['id'] %}selected{% endif %}>{{ p['title'] }}</option>
+        {% endfor %}
+      </select>
+
+      <button>保存</button>
+    </div>
+  </form>
+</section>
+
+<div style="margin-top:12px;"><a href="{{ url_for('index') }}">戻る</a></div>
+"""
 # ---------- ルーティング ----------
 @app.route('/')
 def index():
@@ -902,6 +957,75 @@ def update_meta(task_id):
     write_tasks(tasks)
     return redirect(url_for('index'))
 
+@app.route('/edit/<int:task_id>', methods=['GET', 'POST'])
+def edit_task(task_id):
+    tasks = read_tasks()
+    tags = read_tags()
+
+    task = None
+    for t in tasks:
+        if t['id'] == task_id:
+            task = t
+            break
+
+    if (not task) or int(task.get('completed', 0)) == 1:
+        return redirect(url_for('index'))
+
+    active = [t for t in tasks if int(t.get('completed', 0)) == 0]
+    active_ids = {str(t['id']) for t in active}
+
+    # 親が未完了に存在しない場合はルート扱い
+    children_by_parent = {}
+    for t in active:
+        pid = t.get('parent_id', '')
+        if pid not in active_ids:
+            pid = ''
+        children_by_parent.setdefault(pid, []).append(t)
+
+    # 循環防止：自分＋子孫は親にできない
+    forbidden = {task_id}
+    stack = [str(task_id)]
+    while stack:
+        pid = stack.pop()
+        for ch in children_by_parent.get(pid, []):
+            cid = ch['id']
+            if cid not in forbidden:
+                forbidden.add(cid)
+                stack.append(str(cid))
+
+    parent_candidates = sorted(
+        [t for t in active if t['id'] not in forbidden],
+        key=lambda x: (parse_date(x['due_date']), -x['id'])
+    )
+
+    current_parent = task.get('parent_id', '')
+    if current_parent in active_ids and current_parent.isdigit():
+        current_parent_id = int(current_parent)
+    else:
+        current_parent_id = None
+
+    if request.method == 'POST':
+        new_tag = (request.form.get('tag') or 'マイタスク').strip() or 'マイタスク'
+        if new_tag not in tags:
+            new_tag = 'マイタスク'
+
+        new_parent_id = (request.form.get('parent_id') or '').strip()
+        if not (new_parent_id and new_parent_id.isdigit() and new_parent_id in active_ids and int(new_parent_id) not in forbidden):
+            new_parent_id = ''
+
+        task['tag'] = new_tag
+        task['parent_id'] = new_parent_id
+
+        write_tasks(tasks)
+        return redirect(url_for('index'))
+
+    return render_template_string(
+        EDIT_HTML,
+        task=task,
+        tags=tags,
+        parent_candidates=parent_candidates,
+        current_parent_id=current_parent_id
+    )
 
 if __name__ == '__main__':
     ensure_files()
