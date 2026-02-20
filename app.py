@@ -462,6 +462,27 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
                 期日: {{ t['due_date'] }}
               </span>
 
+                <form style="display:inline;" method="post" action="{{ url_for('update_meta', task_id=t['id']) }}">
+                  <select name="tag">
+                    {% for tg in tags %}
+                      <option value="{{ tg }}" {% if tg == t['tag'] %}selected{% endif %}>{{ tg }}</option>
+                    {% endfor %}
+                  </select>
+                
+                  <select name="parent_id">
+                    <option value="" {% if not t['parent_id_effective'] %}selected{% endif %}>なし</option>
+                    {% for rt in selectable_parents %}
+                      {% if rt['id'] not in t['forbidden_parent_ids'] %}
+                        <option value="{{ rt['id'] }}" {% if rt['id_str'] == t['parent_id_effective'] %}selected{% endif %}>
+                          {{ rt['title'] }}
+                        </option>
+                      {% endif %}
+                    {% endfor %}
+                  </select>
+                
+                  <button title="タグ/親を更新">更新</button>
+                </form>
+
               {% if t['recur'] != 'none' %}
                 <span class="badge">定期: {{ '毎週' if t['recur']=='weekly' else '毎月' }}</span>
               {% endif %}
@@ -620,20 +641,34 @@ def index():
     overdue = [t for t in active if t['is_overdue']]
 
     # ツリー構築
+    active_ids = {str(t['id']) for t in active}
+    
+    # ツリー構築（親が未完了に存在しない場合はルート扱いにする）
     children_by_parent = {}
     for t in active:
-        pid = t['parent_id']
-        if pid is None:
-            pid = ''
-        if pid not in children_by_parent:
-            children_by_parent[pid] = []
-        children_by_parent[pid].append(t)
-    # 親候補（全未完了タスク）
+        pid = t['parent_id'] if t['parent_id'] in active_ids else ''
+        t['parent_id_effective'] = pid
+        children_by_parent.setdefault(pid, []).append(t)
+    
     # 親候補（全未完了タスク）も期日昇順＋新しいid優先
     selectable_parents = sorted(
         active,
         key=lambda x: (parse_date(x['due_date']), -x['id'])
     )
+    
+    # 「自分＋子孫」を親にできないようにする（循環防止）
+    for t in active:
+        forbidden = {t['id']}
+        stack = [t['id_str']]
+        while stack:
+            pid = stack.pop()
+            for ch in children_by_parent.get(pid, []):
+                if ch['id'] not in forbidden:
+                    forbidden.add(ch['id'])
+                    stack.append(ch['id_str'])
+        t['forbidden_parent_ids'] = forbidden
+    
+    
     # ★ 今週カレンダー用データ（今日〜6日後の未完了タスク）
     week_calendar = []
     for offset in range(7):
@@ -812,6 +847,54 @@ def delete_tag():
         if changed:
             write_tasks(tasks)
     return redirect(url_for('tags_page'))
+
+
+@app.route('/update_meta/<int:task_id>', methods=['POST'])
+def update_meta(task_id):
+    new_tag = (request.form.get('tag') or 'マイタスク').strip() or 'マイタスク'
+    new_parent_id = (request.form.get('parent_id') or '').strip()
+
+    tasks = read_tasks()
+    tags = read_tags()
+
+    if new_tag not in tags:
+        new_tag = 'マイタスク'
+
+    active = [t for t in tasks if t['completed'] == 0]
+    active_ids = {str(t['id']) for t in active}
+
+    # 子参照（未完了のみ・存在しない親はルート扱い）
+    children_by_parent = {}
+    for t in active:
+        pid = t['parent_id'] if t['parent_id'] in active_ids else ''
+        children_by_parent.setdefault(pid, []).append(t)
+
+    # self + descendants を禁止（循環防止）
+    forbidden = {task_id}
+    stack = [str(task_id)]
+    while stack:
+        pid = stack.pop()
+        for ch in children_by_parent.get(pid, []):
+            cid = ch['id']
+            if cid not in forbidden:
+                forbidden.add(cid)
+                stack.append(str(cid))
+
+    # 親は「未完了タスクのみ」から選べるように制限
+    if not (new_parent_id and new_parent_id.isdigit() and new_parent_id in active_ids):
+        new_parent_id = ''
+    elif int(new_parent_id) in forbidden:
+        new_parent_id = ''
+
+    for t in tasks:
+        if t['id'] == task_id and t['completed'] == 0:
+            t['tag'] = new_tag
+            t['parent_id'] = new_parent_id
+            break
+
+    write_tasks(tasks)
+    return redirect(url_for('index'))
+
 
 if __name__ == '__main__':
     ensure_files()
