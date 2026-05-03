@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import Flask, render_template_string, request, redirect, url_for, Response
 import os
 import csv
 import io
@@ -11,13 +11,56 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import japanize_matplotlib
+import re
+import threading
+import queue
+import time
+from google.auth.exceptions import RefreshError
+
+
+
+
 app = Flask(__name__)
 
 DATA_DIR = 'data'
+CRED_DIR = 'unupload'
 TASKS_CSV = os.path.join(DATA_DIR, 'tasks.csv')
 TAGS_CSV = os.path.join(DATA_DIR, 'tags.csv')
 TAG_RULES_JSON = os.path.join(DATA_DIR, 'tag_rules.json')  # ← 追加
-TASK_FIELDS = ['id', 'title', 'tag', 'score', 'due_date', 'completed', 'completed_at', 'parent_id', 'recur']
+
+TASK_FIELDS = [
+    'id', 'title', 'tag', 'score', 'due_date',
+    'completed', 'completed_at', 'parent_id', 'recur',
+    'google_task_id', 'sync_pending'
+]
+
+GOOGLE_SYNC_ENABLED = os.environ.get('GOOGLE_SYNC_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on')
+GOOGLE_TASKLIST_TITLE = os.environ.get('GOOGLE_TASKLIST_TITLE', 'TODO同期')
+GOOGLE_CREDENTIALS_JSON = os.environ.get(
+    'GOOGLE_CREDENTIALS_JSON',
+    os.path.join(CRED_DIR, 'credentials.json')
+)
+GOOGLE_TOKEN_JSON = os.path.join(CRED_DIR, 'google_token.json')
+GOOGLE_SCOPES = ['https://www.googleapis.com/auth/tasks']
+
+VALID_SCORES = {30, 40, 50, 60, 70, 80, 90, 100}
+VALID_RECURS = {'none', 'weekly', 'monthly'}
+
+TASKS_LOCK = threading.RLock()
+SYNC_QUEUE = queue.Queue()
+SYNC_WORKER_LOCK = threading.Lock()
+SYNC_STATE_LOCK = threading.Lock()
+SYNC_WORKER_STARTED = False
+SYNC_PULL_REQUESTED = False
+SYNC_PULL_LAST_ENQUEUED_AT = 0.0
+GOOGLE_PULL_MIN_INTERVAL_SEC = 30
+
+CHART_CACHE_LOCK = threading.Lock()
+CHART_CACHE = {
+    'version': None,
+    'png_bytes': None
+}
+
 
 # ---------- 永続化 ----------
 def ensure_files():
@@ -58,10 +101,24 @@ def read_tasks():
     with open(TASKS_CSV, 'r', newline='', encoding='utf-8') as f:
         r = csv.DictReader(f)
         for row in r:
-            row['id'] = int(row['id'])
-            row['score'] = int(row['score']) if row['score'] else 0
-            row['completed'] = int(row['completed']) if row['completed'] else 0
-            tasks.append(row)
+            task_id = to_int(row.get('id'), 0)
+            if task_id <= 0:
+                continue
+
+            task = {
+                'id': task_id,
+                'title': (row.get('title') or '').strip(),
+                'tag': (row.get('tag') or 'マイタスク').strip() or 'マイタスク',
+                'score': to_int(row.get('score'), 0),
+                'due_date': sanitize_due_date(row.get('due_date')),
+                'completed': 1 if to_int(row.get('completed'), 0) else 0,
+                'completed_at': (row.get('completed_at') or '').strip(),
+                'parent_id': sanitize_parent_id(row.get('parent_id')),
+                'recur': sanitize_recur(row.get('recur', 'none')),
+                'google_task_id': (row.get('google_task_id') or '').strip(),
+                'sync_pending': 1 if to_int(row.get('sync_pending'), 0) else 0
+            }
+            tasks.append(task)
     return tasks
 
 def write_tasks(tasks):
@@ -78,9 +135,10 @@ def write_tasks(tasks):
                 'completed': t['completed'],
                 'completed_at': t['completed_at'],
                 'parent_id': t['parent_id'],
-                'recur': t['recur']
+                'recur': t['recur'],
+                'google_task_id': t.get('google_task_id', ''),
+                'sync_pending': t.get('sync_pending', 0)
             })
-
 def next_task_id(tasks):
     return (max([t['id'] for t in tasks]) + 1) if tasks else 1
 
@@ -185,6 +243,320 @@ def add_months(date_str, months):
 def normalize_text(text):
     # 全角 → 半角、濁点など正規化
     return unicodedata.normalize('NFKC', text).lower()
+
+def to_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+def sanitize_due_date(value):
+    value = (value or '').strip()
+    try:
+        return parse_date(value).isoformat()
+    except (TypeError, ValueError):
+        return today_str()
+
+def sanitize_score(value, default=30):
+    score = to_int(value, default)
+    if score not in VALID_SCORES:
+        return default
+    return score
+
+def sanitize_recur(value):
+    value = (value or 'none').strip()
+    if value not in VALID_RECURS:
+        return 'none'
+    return value
+
+def sanitize_parent_id(value):
+    value = (value or '').strip()
+    return value if value.isdigit() else ''
+
+def task_sync_signature(task):
+    return (
+        task.get('title', ''),
+        task.get('due_date', ''),
+        1 if task.get('completed') else 0,
+        task.get('completed_at', '')
+    )
+
+def score_total_last_14_days(tasks):
+    today = dt.date.today()
+    start = today - dt.timedelta(days=13)
+    total = 0
+
+    for t in tasks:
+        if t.get('completed') != 1 or not t.get('completed_at'):
+            continue
+        try:
+            done = parse_dt_iso(t['completed_at']).date()
+        except Exception:
+            continue
+        if start <= done <= today:
+            total += to_int(t.get('score'), 0)
+
+    return total
+
+def get_chart_version():
+    try:
+        return int(os.path.getmtime(TASKS_CSV) * 1000)
+    except OSError:
+        return 0
+
+def get_chart_png_bytes():
+    version = get_chart_version()
+
+    with CHART_CACHE_LOCK:
+        if CHART_CACHE['version'] == version and CHART_CACHE['png_bytes'] is not None:
+            return CHART_CACHE['png_bytes']
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
+
+    chart_b64, _ = chart_last_14_days_png_b64(tasks)
+    png_bytes = base64.b64decode(chart_b64)
+
+    with CHART_CACHE_LOCK:
+        CHART_CACHE['version'] = version
+        CHART_CACHE['png_bytes'] = png_bytes
+
+    return png_bytes
+
+def enqueue_sync_job(job):
+    if not GOOGLE_SYNC_ENABLED:
+        return
+    SYNC_QUEUE.put(job)
+
+def enqueue_task_sync(local_task_id):
+    if not GOOGLE_SYNC_ENABLED:
+        return
+    enqueue_sync_job({
+        'action': 'sync_task',
+        'local_task_id': int(local_task_id)
+    })
+
+def enqueue_google_delete(google_task_id):
+    if not GOOGLE_SYNC_ENABLED or not google_task_id:
+        return
+    enqueue_sync_job({
+        'action': 'delete_google_task',
+        'google_task_id': google_task_id
+    })
+
+def request_google_pull(force=False):
+    if not GOOGLE_SYNC_ENABLED:
+        return
+
+    global SYNC_PULL_REQUESTED
+    global SYNC_PULL_LAST_ENQUEUED_AT
+
+    now = time.time()
+
+    with SYNC_STATE_LOCK:
+        if not force:
+            if SYNC_PULL_REQUESTED:
+                return
+            if now - SYNC_PULL_LAST_ENQUEUED_AT < GOOGLE_PULL_MIN_INTERVAL_SEC:
+                return
+
+        SYNC_PULL_REQUESTED = True
+        SYNC_PULL_LAST_ENQUEUED_AT = now
+
+    enqueue_sync_job({'action': 'pull'})
+
+def mark_google_pull_done():
+    global SYNC_PULL_REQUESTED
+    with SYNC_STATE_LOCK:
+        SYNC_PULL_REQUESTED = False
+
+def start_sync_worker():
+    global SYNC_WORKER_STARTED
+
+    if not GOOGLE_SYNC_ENABLED:
+        return
+
+    with SYNC_WORKER_LOCK:
+        if SYNC_WORKER_STARTED:
+            return
+
+        th = threading.Thread(target=sync_worker_loop, daemon=True)
+        th.start()
+        SYNC_WORKER_STARTED = True
+
+    request_google_pull(force=True)
+
+def get_local_task_snapshot(local_task_id):
+    with TASKS_LOCK:
+        tasks = read_tasks()
+        for t in tasks:
+            if t['id'] == local_task_id:
+                return dict(t)
+    return None
+
+def clear_google_task_id_if_matches(local_task_id, google_task_id):
+    with TASKS_LOCK:
+        tasks = read_tasks()
+        changed = False
+        for t in tasks:
+            if t['id'] == local_task_id and t.get('google_task_id') == google_task_id:
+                t['google_task_id'] = ''
+                t['sync_pending'] = 1
+                changed = True
+                break
+        if changed:
+            write_tasks(tasks)
+        return changed
+
+def create_google_task_for_local(local_task_id, snapshot):
+    google_id = google_insert_task(snapshot)
+    if not google_id:
+        return ''
+
+    delete_created = False
+    existing_google_id = ''
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
+        local_task = None
+        for t in tasks:
+            if t['id'] == local_task_id:
+                local_task = t
+                break
+
+        if not local_task:
+            delete_created = True
+        elif local_task.get('google_task_id') and local_task['google_task_id'] != google_id:
+            delete_created = True
+            existing_google_id = local_task['google_task_id']
+        else:
+            if local_task.get('google_task_id') != google_id:
+                local_task['google_task_id'] = google_id
+                write_tasks(tasks)
+
+    if delete_created:
+        google_delete_task(google_id)
+        return existing_google_id
+
+    return google_id
+
+def mark_task_synced(local_task_id, snapshot, google_task_id):
+    expected_signature = task_sync_signature(snapshot)
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
+        changed = False
+
+        for t in tasks:
+            if t['id'] != local_task_id:
+                continue
+
+            if t.get('google_task_id') != google_task_id and google_task_id:
+                t['google_task_id'] = google_task_id
+                changed = True
+
+            if task_sync_signature(t) == expected_signature:
+                if t.get('sync_pending', 0) != 0:
+                    t['sync_pending'] = 0
+                    changed = True
+
+            if changed:
+                write_tasks(tasks)
+
+            return True
+
+    return False
+
+def sync_local_task_to_google(local_task_id, allow_recreate=True):
+    snapshot = get_local_task_snapshot(local_task_id)
+    if not snapshot:
+        return True
+
+    google_id = snapshot.get('google_task_id', '')
+
+    if not google_id:
+        google_id = create_google_task_for_local(local_task_id, snapshot)
+        if not google_id:
+            return False
+
+        snapshot = get_local_task_snapshot(local_task_id)
+        if not snapshot:
+            return True
+
+    body = {
+        'title': snapshot['title'],
+        'notes': make_google_notes(snapshot)
+    }
+
+    due = google_due_str(snapshot.get('due_date', ''))
+    if due:
+        body['due'] = due
+
+    ok, error_status = google_patch_task_result(google_id, body)
+
+    if ok:
+        if snapshot.get('completed') == 1:
+            ok, error_status = google_patch_task_result(
+                google_id,
+                {'status': 'completed'}
+            )
+        else:
+            ok, error_status = google_patch_task_result(
+                google_id,
+                {'status': 'needsAction'}
+            )
+
+    if ok:
+        mark_task_synced(local_task_id, snapshot, google_id)
+        return True
+
+    if allow_recreate and error_status == 404:
+        clear_google_task_id_if_matches(local_task_id, google_id)
+        return sync_local_task_to_google(local_task_id, allow_recreate=False)
+
+    return False
+
+def process_sync_job(job):
+    action = job.get('action')
+
+    if action == 'sync_task':
+        local_task_id = to_int(job.get('local_task_id'), 0)
+        if local_task_id > 0:
+            sync_local_task_to_google(local_task_id)
+        return
+
+    if action == 'delete_google_task':
+        google_task_id = (job.get('google_task_id') or '').strip()
+        if google_task_id:
+            google_delete_task(google_task_id)
+        return
+
+    if action == 'pull':
+        try:
+            sync_google_to_local()
+        finally:
+            mark_google_pull_done()
+        return
+
+def sync_worker_loop():
+    while True:
+        try:
+            job = SYNC_QUEUE.get(timeout=GOOGLE_PULL_MIN_INTERVAL_SEC)
+        except queue.Empty:
+            try:
+                sync_google_to_local()
+            except Exception:
+                app.logger.exception('バックグラウンド同期に失敗した')
+            else:
+                mark_google_pull_done()
+            continue
+
+        try:
+            process_sync_job(job)
+        except Exception:
+            app.logger.exception('同期ジョブの処理に失敗した: %s', job)
+        finally:
+            SYNC_QUEUE.task_done()
 
 # ---------- スコア集計＆折れ線描画（プロット内は英語） ----------
 def chart_last_14_days_png_b64(tasks):
@@ -292,6 +664,337 @@ def chart_last_14_days_png_b64(tasks):
     return b64, total
 
 
+
+
+def get_google_service():
+    if not GOOGLE_SYNC_ENABLED:
+        return None
+
+    try:
+        from google.auth.transport.requests import Request as GoogleRequest
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError as e:
+        app.logger.warning('Google Tasks ライブラリの読み込みに失敗した: %s', e)
+        return None
+
+    try:
+        creds = None
+
+        if os.path.exists(GOOGLE_TOKEN_JSON):
+            creds = Credentials.from_authorized_user_file(
+                GOOGLE_TOKEN_JSON,
+                GOOGLE_SCOPES
+            )
+
+        if not creds or not creds.valid:
+            try:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(GoogleRequest())
+                else:
+                    raise RefreshError("no valid creds")
+        
+            except RefreshError:
+                if os.path.exists(GOOGLE_TOKEN_JSON):
+                    os.remove(GOOGLE_TOKEN_JSON)
+        
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    GOOGLE_CREDENTIALS_JSON,
+                    GOOGLE_SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+        
+            with open(GOOGLE_TOKEN_JSON, 'w', encoding='utf-8') as f:
+                f.write(creds.to_json())
+
+        return build('tasks', 'v1', credentials=creds)
+    except Exception:
+        app.logger.exception('Google Tasksサービスの初期化に失敗した')
+        return None
+
+
+def get_google_tasklist_id(service):
+    if not service:
+        return None
+
+    try:
+        res = service.tasklists().list(maxResults=100).execute()
+        for item in res.get('items', []):
+            if item.get('title') == GOOGLE_TASKLIST_TITLE:
+                return item['id']
+
+        res = service.tasklists().insert(
+            body={'title': GOOGLE_TASKLIST_TITLE}
+        ).execute()
+        return res['id']
+    except Exception:
+        app.logger.exception('Googleタスクリストの取得に失敗した')
+        return None
+
+
+def google_due_str(date_str):
+    if not date_str:
+        return None
+    return f'{date_str}T00:00:00.000Z'
+
+
+def google_completed_to_local_str(s):
+    if not s:
+        return ''
+    x = dt.datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone()
+    return x.replace(tzinfo=None, microsecond=0).isoformat(sep=' ')
+
+
+def local_id_from_notes(notes):
+    if not notes:
+        return None
+    m = re.search(r'LOCAL_ID=(\d+)', notes)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def make_google_notes(local_task):
+    return f'LOCAL_ID={local_task["id"]}'
+
+
+def google_insert_task(local_task):
+    service = get_google_service()
+    tasklist_id = get_google_tasklist_id(service)
+    if not service or not tasklist_id:
+        return ''
+
+    body = {
+        'title': local_task['title'],
+        'notes': make_google_notes(local_task)
+    }
+
+    due = google_due_str(local_task.get('due_date', ''))
+    if due:
+        body['due'] = due
+
+    try:
+        res = service.tasks().insert(
+            tasklist=tasklist_id,
+            body=body
+        ).execute()
+        return res.get('id', '')
+    except Exception:
+        app.logger.exception('Googleタスクの作成に失敗した')
+        return ''
+
+
+def google_patch_task_result(task_id, body):
+    if not task_id:
+        return False, None
+
+    service = get_google_service()
+    tasklist_id = get_google_tasklist_id(service)
+    if not service or not tasklist_id:
+        return False, None
+
+    try:
+        service.tasks().patch(
+            tasklist=tasklist_id,
+            task=task_id,
+            body=body
+        ).execute()
+        return True, None
+    except Exception as e:
+        status = getattr(getattr(e, 'resp', None), 'status', None)
+        app.logger.exception('Googleタスクの更新に失敗した: %s', task_id)
+        return False, status
+
+
+def google_patch_task(task_id, body):
+    ok, _ = google_patch_task_result(task_id, body)
+    return ok
+
+def google_patch_task_notes(task_id, notes):
+    return google_patch_task(task_id, {'notes': notes})
+
+
+def google_mark_task_completed(task_id):
+    return google_patch_task(task_id, {'status': 'completed'})
+
+
+def google_mark_task_uncompleted(task_id):
+    return google_patch_task(task_id, {'status': 'needsAction'})
+
+
+def google_update_task_due(task_id, due_date):
+    if not due_date:
+        return False
+    return google_patch_task(task_id, {'due': google_due_str(due_date)})
+
+
+def sync_google_to_local():
+    if not GOOGLE_SYNC_ENABLED:
+        return
+
+    service = get_google_service()
+    tasklist_id = get_google_tasklist_id(service)
+    if not service or not tasklist_id:
+        return
+
+    google_tasks = []
+    page_token = None
+
+    try:
+        while True:
+            res = service.tasks().list(
+                tasklist=tasklist_id,
+                showCompleted=True,
+                showHidden=True,
+                showDeleted=True,
+                maxResults=100,
+                pageToken=page_token
+            ).execute()
+
+            google_tasks.extend(res.get('items', []))
+            page_token = res.get('nextPageToken')
+            if not page_token:
+                break
+    except Exception:
+        app.logger.exception('Googleタスクの同期に失敗した')
+        return
+
+    notes_to_patch = []
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
+
+        local_by_id = {t['id']: t for t in tasks}
+        local_by_google_id = {
+            t.get('google_task_id', ''): t
+            for t in tasks
+            if t.get('google_task_id')
+        }
+
+        changed = False
+
+        for gt in google_tasks:
+            google_id = gt.get('id', '')
+            if not google_id:
+                continue
+
+            notes = gt.get('notes', '') or ''
+            local_id = local_id_from_notes(notes)
+
+            local_task = None
+
+            if google_id in local_by_google_id:
+                local_task = local_by_google_id[google_id]
+            elif local_id is not None and local_id in local_by_id:
+                local_task = local_by_id[local_id]
+                if not local_task.get('google_task_id'):
+                    local_task['google_task_id'] = google_id
+                    local_by_google_id[google_id] = local_task
+                    changed = True
+
+            if gt.get('deleted'):
+                if local_task and not local_task.get('sync_pending', 0):
+                    if local_task.get('google_task_id'):
+                        local_task['google_task_id'] = ''
+                        changed = True
+                continue
+
+            if local_task is None:
+                new_id = next_task_id(tasks)
+                due_raw = gt.get('due', '') or ''
+                due_date = due_raw[:10] if due_raw else today_str()
+
+                local_task = {
+                    'id': new_id,
+                    'title': gt.get('title', '').strip() or '(no title)',
+                    'tag': 'マイタスク',
+                    'score': 30,
+                    'due_date': due_date,
+                    'completed': 0,
+                    'completed_at': '',
+                    'parent_id': '',
+                    'recur': 'none',
+                    'google_task_id': google_id,
+                    'sync_pending': 0
+                }
+
+                if gt.get('status') == 'completed':
+                    local_task['completed'] = 1
+                    local_task['completed_at'] = google_completed_to_local_str(
+                        gt.get('completed')
+                    )
+
+                tasks.append(local_task)
+                local_by_id[new_id] = local_task
+                local_by_google_id[google_id] = local_task
+                changed = True
+                notes_to_patch.append((google_id, make_google_notes(local_task)))
+                continue
+
+            if local_task.get('google_task_id') != google_id:
+                local_task['google_task_id'] = google_id
+                changed = True
+
+            if local_id != local_task['id']:
+                notes_to_patch.append((google_id, make_google_notes(local_task)))
+
+            if local_task.get('sync_pending', 0):
+                continue
+
+            remote_title = gt.get('title', '').strip() or '(no title)'
+            if local_task['title'] != remote_title:
+                local_task['title'] = remote_title
+                changed = True
+
+            due_raw = gt.get('due', '') or ''
+            remote_due_date = due_raw[:10] if due_raw else ''
+            if remote_due_date and local_task['due_date'] != remote_due_date:
+                local_task['due_date'] = remote_due_date
+                changed = True
+
+            remote_completed = 1 if gt.get('status') == 'completed' else 0
+            remote_completed_at = ''
+            if remote_completed:
+                remote_completed_at = google_completed_to_local_str(
+                    gt.get('completed')
+                )
+
+            if local_task['completed'] != remote_completed:
+                local_task['completed'] = remote_completed
+                local_task['completed_at'] = remote_completed_at
+                changed = True
+            elif remote_completed and local_task['completed_at'] != remote_completed_at:
+                local_task['completed_at'] = remote_completed_at
+                changed = True
+            elif not remote_completed and local_task['completed_at']:
+                local_task['completed_at'] = ''
+                changed = True
+
+        if changed:
+            write_tasks(tasks)
+
+    for google_id, notes in notes_to_patch:
+        google_patch_task_notes(google_id, notes)
+
+def google_delete_task(task_id):
+    if not task_id:
+        return False
+
+    service = get_google_service()
+    tasklist_id = get_google_tasklist_id(service)
+    if not service or not tasklist_id:
+        return False
+
+    try:
+        service.tasks().delete(
+            tasklist=tasklist_id,
+            task=task_id
+        ).execute()
+        return True
+    except Exception:
+        app.logger.exception('Googleタスクの削除に失敗した: %s', task_id)
+        return False
 # ---------- HTML（グラフは最下部に配置） ----------
 INDEX_HTML = r"""
 <!doctype html>
@@ -479,8 +1182,7 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
             </form>
         
             <form style="display:inline;" method="post"
-                  action="{{ url_for('delete', task_id=t['id']) }}"
-                  onsubmit="return confirm('このタスクを削除しますか？');">
+                  action="{{ url_for('delete', task_id=t['id']) }}">
               <button title="削除">✖</button>
             </form>
         
@@ -554,7 +1256,7 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
 
 <section class="card">
   <h2>過去2週間のスコア推移</h2>
-  <div><img alt="chart" src="data:image/png;base64,{{ chart_b64 }}"></div>
+  <div><img alt="chart" src="{{ url_for('chart_last_14_png') }}?v={{ chart_version }}"></div>
   <div>合計点: <strong>{{ total_14d }}</strong></div>
 </section>
 
@@ -680,12 +1382,18 @@ body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP"
 <div style="margin-top:12px;"><a href="{{ url_for('index') }}">戻る</a></div>
 """
 # ---------- ルーティング ----------
+@app.before_request
+def ensure_background_sync():
+    start_sync_worker()
+
 @app.route('/')
 def index():
-    tasks = read_tasks()
+    request_google_pull()
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
     tags = read_tags()
 
-    # 未完・期限超過判定
     today = dt.date.today()
     active = []
     for t in tasks:
@@ -693,32 +1401,24 @@ def index():
             t['is_overdue'] = parse_date(t['due_date']) < today
             t['id_str'] = str(t['id'])
             active.append(t)
-        # 期日が近いものから順に並べる（期日 → id）
+
     active.sort(key=lambda t: (parse_date(t['due_date']), -t['id']))
-
-   
-
-
 
     overdue = [t for t in active if t['is_overdue']]
 
-    # ツリー構築
     active_ids = {str(t['id']) for t in active}
-    
-    # ツリー構築（親が未完了に存在しない場合はルート扱いにする）
+
     children_by_parent = {}
     for t in active:
         pid = t['parent_id'] if t['parent_id'] in active_ids else ''
         t['parent_id_effective'] = pid
         children_by_parent.setdefault(pid, []).append(t)
-    
-    # 親候補（全未完了タスク）も期日昇順＋新しいid優先
+
     selectable_parents = sorted(
         active,
         key=lambda x: (parse_date(x['due_date']), -x['id'])
     )
-    
-    # 「自分＋子孫」を親にできないようにする（循環防止）
+
     for t in active:
         forbidden = {t['id']}
         stack = [t['id_str']]
@@ -729,9 +1429,7 @@ def index():
                     forbidden.add(ch['id'])
                     stack.append(ch['id_str'])
         t['forbidden_parent_ids'] = forbidden
-    
-    
-    # ★ 今週カレンダー用データ（今日〜6日後の未完了タスク）
+
     week_calendar = []
     for offset in range(7):
         d = today + dt.timedelta(days=offset)
@@ -741,14 +1439,12 @@ def index():
             'date': d,
             'tasks': day_tasks,
         })
-    # 折れ線グラフ（最下部に表示するが、データはここで用意）
-    chart_b64, total_14d = chart_last_14_days_png_b64(tasks)
 
-    # 最近完了
+    total_14d = score_total_last_14_days(tasks)
+
     done = [t for t in tasks if t['completed'] == 1 and t['completed_at']]
     done.sort(key=lambda x: parse_dt_iso(x['completed_at']), reverse=True)
     recent_done = done[:20]
-
 
     return render_template_string(
         INDEX_HTML,
@@ -757,122 +1453,168 @@ def index():
         children_by_parent=children_by_parent,
         selectable_parents=selectable_parents,
         today=today_str(),
-        chart_b64=chart_b64,
+        chart_version=get_chart_version(),
         total_14d=total_14d,
         recent_done=recent_done,
-        week_calendar=week_calendar,  # ← ここを追加
+        week_calendar=week_calendar,
     )
+
+@app.route('/chart_last_14.png')
+def chart_last_14_png():
+    png_bytes = get_chart_png_bytes()
+    resp = Response(png_bytes, mimetype='image/png')
+    resp.headers['Cache-Control'] = 'no-store, max-age=0'
+    return resp
 
 @app.route('/add', methods=['POST'])
 def add():
     title = request.form.get('title', '').strip()
+    if not title:
+        return redirect(url_for('index'))
+
     tag = request.form.get('tag', 'マイタスク').strip() or 'マイタスク'
-    score = int(request.form.get('score', '30'))
-    due_date = request.form.get('due_date', today_str())
-    recur = request.form.get('recur', 'none')
-    parent_id = request.form.get('parent_id', '')
+    score = sanitize_score(request.form.get('score', '30'))
+    due_date = sanitize_due_date(request.form.get('due_date', today_str()))
+    recur = sanitize_recur(request.form.get('recur', 'none'))
+    parent_id = sanitize_parent_id(request.form.get('parent_id', ''))
 
-    tasks = read_tasks()
     tags = read_tags()
-
-    # ここで自動タグ付け
     tag = auto_tag(title, tag, tags)
 
-    tid = next_task_id(tasks)
-    tasks.append({
-        'id': tid,
-        'title': title,
-        'tag': tag,
-        'score': score,
-        'due_date': due_date,
-        'completed': 0,
-        'completed_at': '',
-        'parent_id': parent_id,
-        'recur': recur
-    })
-    write_tasks(tasks)
+    with TASKS_LOCK:
+        tasks = read_tasks()
+        tid = next_task_id(tasks)
+        new_task = {
+            'id': tid,
+            'title': title,
+            'tag': tag,
+            'score': score,
+            'due_date': due_date,
+            'completed': 0,
+            'completed_at': '',
+            'parent_id': parent_id,
+            'recur': recur,
+            'google_task_id': '',
+            'sync_pending': 1 if GOOGLE_SYNC_ENABLED else 0
+        }
+        tasks.append(new_task)
+        write_tasks(tasks)
+
+    enqueue_task_sync(tid)
     return redirect(url_for('index'))
 
 
 @app.route('/complete/<int:task_id>', methods=['POST'])
 def complete(task_id):
-    tasks = read_tasks()
     now = dt.datetime.now().replace(microsecond=0)
-    for t in tasks:
-        if t['id'] == task_id and t['completed'] == 0:
-            t['completed'] = 1
-            t['completed_at'] = now.isoformat(sep=' ')
-            # 定期タスク生成
-            if t['recur'] == 'weekly':
-                next_due = (parse_date(t['due_date']) + dt.timedelta(days=7)).isoformat()
-            elif t['recur'] == 'monthly':
-                next_due = add_months(t['due_date'], 1)
-            else:
-                next_due = None
-            if next_due:
-                new_id = next_task_id(tasks)
-                tasks.append({
-                    'id': new_id,
-                    'title': t['title'],
-                    'tag': t['tag'],
-                    'score': t['score'],
-                    'due_date': next_due,
-                    'completed': 0,
-                    'completed_at': '',
-                    'parent_id': t['parent_id'],
-                    'recur': t['recur']
-                })
-            break
-    write_tasks(tasks)
+    new_task_id = 0
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
+
+        for t in tasks:
+            if t['id'] == task_id and t['completed'] == 0:
+                t['completed'] = 1
+                t['completed_at'] = now.isoformat(sep=' ')
+                t['sync_pending'] = 1 if GOOGLE_SYNC_ENABLED else 0
+
+                if t['recur'] == 'weekly':
+                    next_due = (parse_date(t['due_date']) + dt.timedelta(days=7)).isoformat()
+                elif t['recur'] == 'monthly':
+                    next_due = add_months(t['due_date'], 1)
+                else:
+                    next_due = None
+
+                if next_due:
+                    new_task_id = next_task_id(tasks)
+                    new_task = {
+                        'id': new_task_id,
+                        'title': t['title'],
+                        'tag': t['tag'],
+                        'score': t['score'],
+                        'due_date': next_due,
+                        'completed': 0,
+                        'completed_at': '',
+                        'parent_id': t['parent_id'],
+                        'recur': t['recur'],
+                        'google_task_id': '',
+                        'sync_pending': 1 if GOOGLE_SYNC_ENABLED else 0
+                    }
+                    tasks.append(new_task)
+                break
+
+        write_tasks(tasks)
+
+    enqueue_task_sync(task_id)
+    if new_task_id:
+        enqueue_task_sync(new_task_id)
+
     return redirect(url_for('index'))
 
 @app.route('/reschedule/<int:task_id>', methods=['POST'])
 def reschedule(task_id):
-    new_due = request.form.get('new_due_date', today_str())
-    tasks = read_tasks()
+    new_due = sanitize_due_date(request.form.get('new_due_date', today_str()))
 
-    for t in tasks:
-        if t['id'] == task_id and t['completed'] == 0:
+    with TASKS_LOCK:
+        tasks = read_tasks()
 
-            # 期日を新しく更新
-            t['due_date'] = new_due
+        for t in tasks:
+            if t['id'] == task_id and t['completed'] == 0:
+                t['due_date'] = new_due
+                t['score'] = to_int(t['score'], 0) + 30
+                t['sync_pending'] = 1 if GOOGLE_SYNC_ENABLED else 0
+                break
 
-            # ★ ここで +30 点する（100超えてOK）
-            t['score'] = int(t['score']) + 30
+        write_tasks(tasks)
 
-            break
-
-    write_tasks(tasks)
+    enqueue_task_sync(task_id)
     return redirect(url_for('index'))
 
 
 # --- 追加: タスク削除（自分＋子孫を再帰的に削除） ---
 @app.route('/delete/<int:task_id>', methods=['POST'])
 def delete(task_id):
-    tasks = read_tasks()
-    to_delete = set([task_id])
-    changed = True
-    while changed:
-        changed = False
-        for t in tasks:
-            pid = t.get('parent_id', '')
-            if pid and str(pid).isdigit() and int(pid) in to_delete and t['id'] not in to_delete:
-                to_delete.add(t['id'])
-                changed = True
-    tasks = [t for t in tasks if t['id'] not in to_delete]
-    write_tasks(tasks)
+    with TASKS_LOCK:
+        tasks = read_tasks()
+
+        to_delete = set([task_id])
+        changed = True
+        while changed:
+            changed = False
+            for t in tasks:
+                pid = t.get('parent_id', '')
+                if pid and str(pid).isdigit() and int(pid) in to_delete and t['id'] not in to_delete:
+                    to_delete.add(t['id'])
+                    changed = True
+
+        delete_google_ids = [
+            t.get('google_task_id', '')
+            for t in tasks
+            if t['id'] in to_delete and t.get('google_task_id')
+        ]
+
+        tasks = [t for t in tasks if t['id'] not in to_delete]
+        write_tasks(tasks)
+
+    for gid in delete_google_ids:
+        enqueue_google_delete(gid)
+
     return redirect(url_for('index'))
 
 # --- 追加: 完了取り消し（未完了に戻す） ---
 @app.route('/undo/<int:task_id>', methods=['POST'])
 def undo(task_id):
-    tasks = read_tasks()
-    for t in tasks:
-        if t['id'] == task_id:
-            t['completed'] = 0
-            t['completed_at'] = ''
-            break
-    write_tasks(tasks)
+    with TASKS_LOCK:
+        tasks = read_tasks()
+        for t in tasks:
+            if t['id'] == task_id:
+                t['completed'] = 0
+                t['completed_at'] = ''
+                t['sync_pending'] = 1 if GOOGLE_SYNC_ENABLED else 0
+                break
+        write_tasks(tasks)
+
+    enqueue_task_sync(task_id)
     return redirect(url_for('index'))
 
 @app.route('/tags')
@@ -900,14 +1642,15 @@ def delete_tag():
             tags.insert(0, 'マイタスク')
         write_tags(tags)
         # 紐づくタスクは「マイタスク」へ移行
-        tasks = read_tasks()
-        changed = False
-        for t in tasks:
-            if t['tag'] == tag:
-                t['tag'] = 'マイタスク'
-                changed = True
-        if changed:
-            write_tasks(tasks)
+        with TASKS_LOCK:
+            tasks = read_tasks()
+            changed = False
+            for t in tasks:
+                if t['tag'] == tag:
+                    t['tag'] = 'マイタスク'
+                    changed = True
+            if changed:
+                write_tasks(tasks)
     return redirect(url_for('tags_page'))
 
 
@@ -916,51 +1659,53 @@ def update_meta(task_id):
     new_tag = (request.form.get('tag') or 'マイタスク').strip() or 'マイタスク'
     new_parent_id = (request.form.get('parent_id') or '').strip()
 
-    tasks = read_tasks()
     tags = read_tags()
 
     if new_tag not in tags:
         new_tag = 'マイタスク'
 
-    active = [t for t in tasks if t['completed'] == 0]
-    active_ids = {str(t['id']) for t in active}
+    with TASKS_LOCK:
+        tasks = read_tasks()
 
-    # 子参照（未完了のみ・存在しない親はルート扱い）
-    children_by_parent = {}
-    for t in active:
-        pid = t['parent_id'] if t['parent_id'] in active_ids else ''
-        children_by_parent.setdefault(pid, []).append(t)
+        active = [t for t in tasks if t['completed'] == 0]
+        active_ids = {str(t['id']) for t in active}
 
-    # self + descendants を禁止（循環防止）
-    forbidden = {task_id}
-    stack = [str(task_id)]
-    while stack:
-        pid = stack.pop()
-        for ch in children_by_parent.get(pid, []):
-            cid = ch['id']
-            if cid not in forbidden:
-                forbidden.add(cid)
-                stack.append(str(cid))
+        children_by_parent = {}
+        for t in active:
+            pid = t['parent_id'] if t['parent_id'] in active_ids else ''
+            children_by_parent.setdefault(pid, []).append(t)
 
-    # 親は「未完了タスクのみ」から選べるように制限
-    if not (new_parent_id and new_parent_id.isdigit() and new_parent_id in active_ids):
-        new_parent_id = ''
-    elif int(new_parent_id) in forbidden:
-        new_parent_id = ''
+        forbidden = {task_id}
+        stack = [str(task_id)]
+        while stack:
+            pid = stack.pop()
+            for ch in children_by_parent.get(pid, []):
+                cid = ch['id']
+                if cid not in forbidden:
+                    forbidden.add(cid)
+                    stack.append(str(cid))
 
-    for t in tasks:
-        if t['id'] == task_id and t['completed'] == 0:
-            t['tag'] = new_tag
-            t['parent_id'] = new_parent_id
-            break
+        if not (new_parent_id and new_parent_id.isdigit() and new_parent_id in active_ids):
+            new_parent_id = ''
+        elif int(new_parent_id) in forbidden:
+            new_parent_id = ''
 
-    write_tasks(tasks)
+        for t in tasks:
+            if t['id'] == task_id and t['completed'] == 0:
+                t['tag'] = new_tag
+                t['parent_id'] = new_parent_id
+                break
+
+        write_tasks(tasks)
+
     return redirect(url_for('index'))
 
 @app.route('/edit/<int:task_id>', methods=['GET', 'POST'])
 def edit_task(task_id):
-    tasks = read_tasks()
     tags = read_tags()
+
+    with TASKS_LOCK:
+        tasks = read_tasks()
 
     task = None
     for t in tasks:
@@ -974,7 +1719,6 @@ def edit_task(task_id):
     active = [t for t in tasks if int(t.get('completed', 0)) == 0]
     active_ids = {str(t['id']) for t in active}
 
-    # 親が未完了に存在しない場合はルート扱い
     children_by_parent = {}
     for t in active:
         pid = t.get('parent_id', '')
@@ -982,7 +1726,6 @@ def edit_task(task_id):
             pid = ''
         children_by_parent.setdefault(pid, []).append(t)
 
-    # 循環防止：自分＋子孫は親にできない
     forbidden = {task_id}
     stack = [str(task_id)]
     while stack:
@@ -1013,10 +1756,15 @@ def edit_task(task_id):
         if not (new_parent_id and new_parent_id.isdigit() and new_parent_id in active_ids and int(new_parent_id) not in forbidden):
             new_parent_id = ''
 
-        task['tag'] = new_tag
-        task['parent_id'] = new_parent_id
+        with TASKS_LOCK:
+            tasks = read_tasks()
+            for current in tasks:
+                if current['id'] == task_id:
+                    current['tag'] = new_tag
+                    current['parent_id'] = new_parent_id
+                    break
+            write_tasks(tasks)
 
-        write_tasks(tasks)
         return redirect(url_for('index'))
 
     return render_template_string(
