@@ -663,8 +663,160 @@ def chart_last_14_days_png_b64(tasks):
     b64 = base64.b64encode(buf.getvalue()).decode('ascii')
     return b64, total
 
+def chart_today_progress_png_b64(tasks):
+    def char_width(ch):
+        return 2 if unicodedata.east_asian_width(ch) in ('F', 'W', 'A') else 1
 
+    def wrap_label(text, max_width=24, max_lines=2):
+        text = str(text)
+        lines = []
+        line = ''
+        width = 0
 
+        for ch in text:
+            w = char_width(ch)
+            if width + w > max_width and line:
+                lines.append(line)
+                line = ch
+                width = w
+            else:
+                line += ch
+                width += w
+
+            if len(lines) >= max_lines:
+                break
+
+        if line and len(lines) < max_lines:
+            lines.append(line)
+
+        consumed = ''.join(lines)
+        if len(consumed) < len(text):
+            lines[-1] = lines[-1].rstrip('…') + '…'
+
+        return '\n'.join(lines)
+
+    today = dt.date.today()
+
+    done_today = []
+    for t in tasks:
+        if t.get('completed') != 1 or not t.get('completed_at'):
+            continue
+        try:
+            done = parse_dt_iso(t['completed_at']).date()
+        except Exception:
+            continue
+        if done == today:
+            done_today.append(t)
+
+    done_today.sort(
+        key=lambda x: parse_dt_iso(x['completed_at']) if x['completed_at'] else dt.datetime.min
+    )
+
+    n = len(done_today)
+
+    fig_h = max(1.6, 0.65 * max(n, 1) + 0.2)
+    fig = plt.figure(figsize=(11.0, fig_h), dpi=130)
+    ax = fig.add_subplot(111)
+
+    if n == 0:
+        ax.text(
+            0.5,
+            0.5,
+            'No completed tasks today',
+            ha='center',
+            va='center',
+            fontsize=18
+        )
+        ax.set_axis_off()
+    else:
+        colors = [
+            '#4f83f1',
+            '#f45b69',
+            '#f2c94c',
+            '#2fb344',
+            '#9b5de5',
+            '#00a6a6',
+            '#f2994a',
+            '#6c757d'
+        ]
+
+        text_colors = [
+            '#2457c5',
+            '#c5303f',
+            '#9a6b00',
+            '#1f7a32',
+            '#6f35c2',
+            '#007575',
+            '#b75f00',
+            '#444444'
+        ]
+
+        scores = []
+        for t in done_today:
+            scores.append(max(to_int(t.get('score'), 0), 0))
+
+        max_total = sum(scores)
+        if max_total <= 0:
+            max_total = 1
+
+        for row in range(n):
+            left = 0
+
+            for j in range(row + 1):
+                sc = scores[j]
+                if sc <= 0:
+                    continue
+
+                ax.barh(
+                    row,
+                    sc,
+                    left=left,
+                    height=0.78,
+                    color=colors[j % len(colors)],
+                    edgecolor='white',
+                    linewidth=0.8
+                )
+                left += sc
+
+            title = wrap_label(done_today[row]['title'], max_width=24, max_lines=2)
+
+            ax.text(
+                left + max_total * 0.03,
+                row,
+                title,
+                ha='left',
+                va='center',
+                fontsize=16,
+                fontweight='bold',
+                linespacing=1.15,
+                color=text_colors[row % len(text_colors)]
+            )
+
+        ax.set_xlim(0, max_total * 2.15)
+        ax.set_ylim(-0.55, n - 0.45)
+
+        ax.set_yticks([])
+        ax.tick_params(axis='x', labelsize=13, pad=1)
+
+        ax.grid(True, axis='x', linestyle='--', linewidth=0.6, alpha=0.65)
+
+        for spine in ['top', 'right', 'left']:
+            ax.spines[spine].set_visible(False)
+
+        ax.spines['bottom'].set_alpha(0.4)
+
+    fig.subplots_adjust(
+        left=0.03,
+        right=0.99,
+        top=0.99,
+        bottom=0.07
+    )
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    plt.close(fig)
+
+    return base64.b64encode(buf.getvalue()).decode('ascii')
 
 def get_google_service():
     if not GOOGLE_SYNC_ENABLED:
@@ -828,6 +980,8 @@ def google_update_task_due(task_id, due_date):
         return False
     return google_patch_task(task_id, {'due': google_due_str(due_date)})
 
+def google_sync_available():
+    return GOOGLE_SYNC_ENABLED and os.path.exists(GOOGLE_CREDENTIALS_JSON)
 
 def sync_google_to_local():
     if not GOOGLE_SYNC_ENABLED:
@@ -939,7 +1093,19 @@ def sync_google_to_local():
             if local_id != local_task['id']:
                 notes_to_patch.append((google_id, make_google_notes(local_task)))
 
+            remote_completed = 1 if gt.get('status') == 'completed' else 0
+            remote_completed_at = ''
+            if remote_completed:
+                remote_completed_at = google_completed_to_local_str(
+                    gt.get('completed')
+                )
+            
             if local_task.get('sync_pending', 0):
+                if remote_completed:
+                    local_task['completed'] = 1
+                    local_task['completed_at'] = remote_completed_at
+                    local_task['sync_pending'] = 0
+                    changed = True
                 continue
 
             remote_title = gt.get('title', '').strip() or '(no title)'
@@ -1089,22 +1255,59 @@ button, input[type=submit] { cursor:pointer; }
 table { border-collapse: collapse; }
 td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
 .form-inline > * { margin-right: 8px; }
+
+
 .score-choices label { margin-right:6px; }
+
+.task-register-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.task-register-layout > section {
+  margin-bottom: 0;
+}
+
+.task-register-card {
+  flex: 0 0 430px;
+}
+
+.task-chart-card {
+  flex: 1 1 720px;
+  min-height: 0;
+  padding: 4px 8px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+}
+
+.task-chart-card img {
+  width: 100%;
+  max-width: 980px;
+  height: auto;
+  display: block;
+}
+
+@media (max-width: 900px) {
+  .task-register-layout {
+    flex-direction: column;
+  }
+
+  .task-register-card {
+    flex: auto;
+  }
+
+  .task-chart-card {
+    width: 100%;
+  }
+}
 </style>
 
 
-<h1>TODOダッシュボード</h1>
 
-<section class="card">
-  <h2>タグ</h2>
-  <div>
-    既存タグ:
-        {% for t in tags %}
-          <span class="badge badge-tag">{{ t }}</span>
-        {% endfor %}
-  </div>
-  <div style="margin-top:8px;"><a href="{{ url_for('tags_page') }}">タグの追加・削除</a></div>
-</section>
+
 
 {% if overdue %}
 <section class="card">
@@ -1121,51 +1324,45 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
 </section>
 {% endif %}
 
-<section class="card">
-  <h2>タスク登録</h2>
-  <form method="post" action="{{ url_for('add') }}">
-    <div class="form-inline">
-    
-    <label>タイトル</label><input type="text" name="title" required>
-    
-    <label>タグ</label>
-    <select name="tag">
-      {% for t in tags %}
-        <option value="{{ t }}" {% if t == 'マイタスク' %}selected{% endif %}>{{ t }}</option>
-      {% endfor %}
-    </select>
-    
-    <label>親タスク</label>
-    <select name="parent_id">
-      <option value="">なし</option>
-      {% for rt in selectable_parents %}
-        <option value="{{ rt['id'] }}">{{ rt['title'] }}</option>
-      {% endfor %}
-    </select>
-    
-    <label>期日</label>
-    <input type="date" name="due_date" value="{{ today }}">
-    
-    <label>定期</label>
-    <select name="recur">
-      <option value="none" selected>なし</option>
-      <option value="weekly">毎週</option>
-      <option value="monthly">毎月</option>
-    </select>
+<div class="task-register-layout">
 
-      
-    </div>
-    <div style="margin-top:8px;">
-      <div>点数（デフォルト30）</div>
-      <div class="score-choices">
-        {% for s in [30,40,50,60,70,80,90,100] %}
-          <label><input type="radio" name="score" value="{{ s }}" {% if s==30 %}checked{% endif %}>{{ s }}</label>
-        {% endfor %}
+  <section class="card task-register-card">
+    <h2>タスク登録</h2>
+
+    <form method="post" action="{{ url_for('add') }}">
+      <div class="form-inline">
+        <label>タイトル</label>
+        <input type="text" name="title" required>
       </div>
-    </div>
-    <div style="margin-top:8px;"><input type="submit" value="追加"></div>
-  </form>
-</section>
+
+      <div class="form-inline" style="margin-top:8px;">
+        <label>期日</label>
+        <input type="date" name="due_date" value="{{ today }}">
+      </div>
+
+      <div style="margin-top:8px;">
+        <div>点数（デフォルト30）</div>
+        <div class="score-choices">
+          {% for s in [30,40,50,60,70,80,90,100] %}
+            <label><input type="radio" name="score" value="{{ s }}" {% if s==30 %}checked{% endif %}>{{ s }}</label>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div style="margin-top:8px;">
+        <input type="submit" value="追加">
+      </div>
+    </form>
+  </section>
+
+    <section class="card task-chart-card">
+      <img
+        alt="today progress chart"
+        src="{{ url_for('chart_today_progress_png') }}?v={{ chart_version }}"
+      >
+    </section>
+
+</div>
 
 <section class="card">
   <h2>未完了タスク</h2>
@@ -1259,6 +1456,15 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
   <div><img alt="chart" src="{{ url_for('chart_last_14_png') }}?v={{ chart_version }}"></div>
   <div>合計点: <strong>{{ total_14d }}</strong></div>
 </section>
+
+
+{% if google_sync_available %}
+<section class="card">
+  <form method="post" action="{{ url_for('refresh_google') }}">
+    <button type="submit">Googleから更新</button>
+  </form>
+</section>
+{% endif %}
 
 <section class="card">
   <h2>最近完了</h2>
@@ -1366,15 +1572,23 @@ body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP"
         {% endfor %}
       </select>
 
-      <label>親タスク</label>
-      <select name="parent_id">
-        <option value="" {% if current_parent_id is none %}selected{% endif %}>なし</option>
-        {% for p in parent_candidates %}
-          <option value="{{ p['id'] }}" {% if current_parent_id == p['id'] %}selected{% endif %}>{{ p['title'] }}</option>
-        {% endfor %}
-      </select>
-
-      <button>保存</button>
+    <label>親タスク</label>
+    <select name="parent_id">
+      <option value="" {% if current_parent_id is none %}selected{% endif %}>なし</option>
+      {% for p in parent_candidates %}
+        <option value="{{ p['id'] }}" {% if current_parent_id == p['id'] %}selected{% endif %}>{{ p['title'] }}</option>
+      {% endfor %}
+    </select>
+    
+    <label>期日</label>
+    <input type="date" name="due_date" value="{{ task['due_date'] }}">
+    <label>定期</label>
+    <select name="recur">
+      <option value="none" {% if task['recur'] == 'none' %}selected{% endif %}>なし</option>
+      <option value="weekly" {% if task['recur'] == 'weekly' %}selected{% endif %}>毎週</option>
+      <option value="monthly" {% if task['recur'] == 'monthly' %}selected{% endif %}>毎月</option>
+    </select>
+    <button>保存</button>
     </div>
   </form>
 </section>
@@ -1457,11 +1671,26 @@ def index():
         total_14d=total_14d,
         recent_done=recent_done,
         week_calendar=week_calendar,
+        google_sync_available=google_sync_available(),
     )
+
+
 
 @app.route('/chart_last_14.png')
 def chart_last_14_png():
     png_bytes = get_chart_png_bytes()
+    resp = Response(png_bytes, mimetype='image/png')
+    resp.headers['Cache-Control'] = 'no-store, max-age=0'
+    return resp
+
+@app.route('/chart_today_progress.png')
+def chart_today_progress_png():
+    with TASKS_LOCK:
+        tasks = read_tasks()
+
+    chart_b64 = chart_today_progress_png_b64(tasks)
+    png_bytes = base64.b64decode(chart_b64)
+
     resp = Response(png_bytes, mimetype='image/png')
     resp.headers['Cache-Control'] = 'no-store, max-age=0'
     return resp
@@ -1503,6 +1732,14 @@ def add():
     enqueue_task_sync(tid)
     return redirect(url_for('index'))
 
+@app.route('/refresh_google', methods=['POST'])
+def refresh_google():
+    if google_sync_available():
+        try:
+            sync_google_to_local()
+        except Exception:
+            app.logger.exception('手動Google同期に失敗した')
+    return redirect(url_for('index'))
 
 @app.route('/complete/<int:task_id>', methods=['POST'])
 def complete(task_id):
@@ -1751,20 +1988,28 @@ def edit_task(task_id):
         new_tag = (request.form.get('tag') or 'マイタスク').strip() or 'マイタスク'
         if new_tag not in tags:
             new_tag = 'マイタスク'
-
+    
         new_parent_id = (request.form.get('parent_id') or '').strip()
         if not (new_parent_id and new_parent_id.isdigit() and new_parent_id in active_ids and int(new_parent_id) not in forbidden):
             new_parent_id = ''
-
+    
+        new_due_date = sanitize_due_date(
+            request.form.get('due_date') or task.get('due_date') or today_str()
+        )
+    
         with TASKS_LOCK:
             tasks = read_tasks()
             for current in tasks:
                 if current['id'] == task_id:
                     current['tag'] = new_tag
                     current['parent_id'] = new_parent_id
+                    current['due_date'] = new_due_date
+                    current['sync_pending'] = 1 if GOOGLE_SYNC_ENABLED else 0
                     break
             write_tasks(tasks)
-
+    
+        enqueue_task_sync(task_id)
+    
         return redirect(url_for('index'))
 
     return render_template_string(
