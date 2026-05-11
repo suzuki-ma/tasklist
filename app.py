@@ -809,7 +809,7 @@ def chart_today_progress_png_b64(tasks):
         left=0.03,
         right=0.99,
         top=0.99,
-        bottom=0.07
+        bottom=0.15
     )
 
     buf = io.BytesIO()
