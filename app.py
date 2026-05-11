@@ -827,6 +827,7 @@ def get_google_service():
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
+        from google.auth.exceptions import RefreshError  # ← ★ここに移動させる
     except ImportError as e:
         app.logger.warning('Google Tasks ライブラリの読み込みに失敗した: %s', e)
         return None
