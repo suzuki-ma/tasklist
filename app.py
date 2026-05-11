@@ -791,7 +791,15 @@ def chart_today_progress_png_b64(tasks):
                 linespacing=1.15,
                 color=text_colors[row % len(text_colors)]
             )
-
+        ax.text(
+            max_total * 1.45,
+            0,
+            f'合計 {max_total} 点',
+            ha='left',
+            va='center',
+            fontsize=28,
+            fontweight='bold'
+        )
         ax.set_xlim(0, max_total * 2.15)
         ax.set_ylim(-0.55, n - 0.45)
 
@@ -1176,7 +1184,9 @@ small { color: #666; }
 input[type=text] { width: 20em; }
 ul.tree, ul.tree ul { list-style: none; padding-left: 1em; border-left: 1px dotted #ccc; }
 li.task { margin: 4px 0; padding-left: .3em; }
-
+li.task-date-gap {
+  height: 12px;
+}
 /* 1タスクの“1行表示”はこの箱（task-row）だけに適用する */
 .task-row{
   display:flex;
@@ -1372,7 +1382,14 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
     <div style="flex:2; min-width: 260px;">
       <ul class="tree">
         {% macro render_children(pid) %}
+          {% set ns = namespace(prev_due='', gap_inserted=false) %}
+        
           {% for t in children_by_parent.get(pid, []) %}
+            {% if pid == '' and not ns.gap_inserted and ns.prev_due == today and t['due_date'] > today %}
+              <li class="task-date-gap"></li>
+              {% set ns.gap_inserted = true %}
+            {% endif %}
+        
          <li class="task">
           <div class="task-row">
             <form style="display:inline;" method="post" action="{{ url_for('complete', task_id=t['id']) }}">
@@ -1411,7 +1428,7 @@ td, th { padding: 4px 6px; border-bottom:1px solid #eee; }
             {{ render_children(t['id_str']) }}
           </ul>
         </li>
-            
+            {% set ns.prev_due = t['due_date'] %}
           {% endfor %}
         {% endmacro %}
         {{ render_children('') }}
