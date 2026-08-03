@@ -35,7 +35,6 @@ TASK_FIELDS = [
     'google_task_id', 'sync_pending'
 ]
 
-GOOGLE_SYNC_ENABLED = os.environ.get('GOOGLE_SYNC_ENABLED', '1').lower() in ('1', 'true', 'yes', 'on')
 GOOGLE_TASKLIST_TITLE = os.environ.get('GOOGLE_TASKLIST_TITLE', 'TODO同期')
 GOOGLE_CREDENTIALS_JSON = os.environ.get(
     'GOOGLE_CREDENTIALS_JSON',
@@ -44,6 +43,21 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get(
 GOOGLE_TOKEN_JSON = os.path.join(CRED_DIR, 'google_token.json')
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/tasks']
 CODEX_TASK_API_TOKEN = os.environ.get('CODEX_TASK_API_TOKEN', '').strip()
+
+def resolve_google_sync_enabled(setting, credentials_path):
+    normalized = (setting or 'auto').strip().lower()
+    if normalized in ('1', 'true', 'yes', 'on'):
+        return True
+    if normalized in ('0', 'false', 'no', 'off'):
+        return False
+    return os.path.exists(credentials_path)
+
+
+GOOGLE_SYNC_SETTING = os.environ.get('GOOGLE_SYNC_ENABLED', 'auto')
+GOOGLE_SYNC_ENABLED = resolve_google_sync_enabled(
+    GOOGLE_SYNC_SETTING,
+    GOOGLE_CREDENTIALS_JSON
+)
 
 VALID_SCORES = {30, 60, 100}
 VALID_RECURS = {'none', 'weekly', 'monthly'}

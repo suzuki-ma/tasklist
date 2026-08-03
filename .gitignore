@@ -2,3 +2,5 @@ unupload/
 data/
 __pycache__/
 *.pyc
+.venv/
+.test-runtime*/
