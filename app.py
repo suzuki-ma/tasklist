@@ -1555,9 +1555,9 @@ li.task-date-gap {
   padding: 6px 8px;
   border: 1px solid transparent;
   border-radius: 10px;
-  cursor: grab;
+  cursor: pointer;
 }
-.task-row:active { cursor: grabbing; }
+.task-row:active { cursor: pointer; }
 .task-row:hover {
   border-color: var(--line);
   background: var(--surface-soft);
@@ -1596,6 +1596,13 @@ li.task-date-gap {
 }
 .drag-handle:hover { color: #fff; background: #2f3a50; }
 .drag-handle:active { cursor: grabbing; }
+.order-drag-handle {
+  margin-left: auto;
+  color: #172033;
+  border-color: #7a8497;
+  background: #fff;
+}
+.order-drag-handle:hover { color: #172033; background: #eef1f6; }
 li.task.dragging > .task-row { opacity: .35; border-style: dashed; }
 .task-order-gap {
   position: relative;
@@ -2171,7 +2178,7 @@ td, th, .score-choices label, .advanced-options,
             data-due-scope="{{ 'overdue' if t['is_overdue'] else ('today' if t['due_date'] == today else 'future') }}"
           >
            <div class="task-row">
-             <span class="drag-handle" draggable="true" title="ここをドラッグして移動" aria-label="{{ t['title'] }}をドラッグして移動">↕ 移動</span>
+             <span class="drag-handle parent-drag-handle" draggable="true" title="ドラッグして別タスクの子にする" aria-label="{{ t['title'] }}をドラッグして別タスクの子にする">↳ 親子</span>
 
             <form style="display:inline;" method="post" action="{{ url_for('complete', task_id=t['id']) }}">
               <button class="btn-complete" title="完了" aria-label="{{ t['title'] }}を完了">✔</button>
@@ -2221,7 +2228,9 @@ td, th, .score-choices label, .advanced-options,
               <span class="badge">定期: {{ '毎週' if t['recur']=='weekly' else '毎月' }}</span>
             {% endif %}
         
-            <a class="btn-edit" href="{{ url_for('edit_task', task_id=t['id']) }}" title="タスクを編集" aria-label="{{ t['title'] }}を編集">✎</a>
+            {% if pid == '' %}
+              <span class="drag-handle order-drag-handle" draggable="true" title="ドラッグして同じ期日の順番を変える" aria-label="{{ t['title'] }}をドラッグして順番を変える">↕ 順番</span>
+            {% endif %}
           </div>
         
           <ul data-parent-id="{{ t['id'] }}">
@@ -2382,6 +2391,7 @@ td, th, .score-choices label, .advanced-options,
 
   let draggedTask = null;
   let draggedList = null;
+  let dragIntent = null;
   let dropMode = null;
   let orderReference = null;
   let parentTarget = null;
@@ -2482,6 +2492,7 @@ td, th, .score-choices label, .advanced-options,
     if (draggedTask) draggedTask.classList.remove('dragging');
     draggedTask = null;
     draggedList = null;
+    dragIntent = null;
   }
 
   function finishPointerTracking() {
@@ -2519,7 +2530,9 @@ td, th, .score-choices label, .advanced-options,
   window.addEventListener('pointercancel', finishPointerTracking);
 
   tree.addEventListener('dragstart', (event) => {
-    const handle = event.target.closest('.drag-handle');
+    const parentHandle = event.target.closest('.parent-drag-handle');
+    const orderHandle = event.target.closest('.order-drag-handle');
+    const handle = parentHandle || orderHandle;
     if (!handle) {
       event.preventDefault();
       return;
@@ -2528,10 +2541,16 @@ td, th, .score-choices label, .advanced-options,
     if (!row) return;
     draggedTask = row.closest('li.task');
     draggedList = draggedTask.parentElement;
+    dragIntent = orderHandle ? 'order' : 'parent';
+    if (dragIntent === 'order' && draggedList !== tree) {
+      event.preventDefault();
+      finishDrag();
+      return;
+    }
     draggedTask.classList.add('dragging');
     tree.classList.add('is-dragging');
-    if (draggedList === tree) tree.classList.add('is-order-dragging');
-    if (draggedTask.dataset.parentId && detachParentDrop) {
+    if (dragIntent === 'order') tree.classList.add('is-order-dragging');
+    if (dragIntent === 'parent' && draggedTask.dataset.parentId && detachParentDrop) {
       detachParentDrop.classList.add('is-visible');
       detachParentDrop.setAttribute('aria-hidden', 'false');
     }
@@ -2542,8 +2561,13 @@ td, th, .score-choices label, .advanced-options,
   tree.addEventListener('dragover', (event) => {
     if (!draggedTask) return;
 
-    const gap = event.target.closest('.task-order-gap');
-    if (gap) {
+    if (dragIntent === 'order') {
+      const gap = event.target.closest('.task-order-gap');
+      if (!gap) {
+        clearDropMarkers();
+        clearDropIntent();
+        return;
+      }
       const reference = orderReferenceForGap(gap);
       if (!reference) return;
       event.preventDefault();
@@ -2555,6 +2579,8 @@ td, th, .score-choices label, .advanced-options,
       event.dataTransfer.dropEffect = 'move';
       return;
     }
+
+    if (dragIntent !== 'parent') return;
 
     const row = event.target.closest('.task-row');
     const target = row?.closest('li.task');
@@ -2609,7 +2635,7 @@ td, th, .score-choices label, .advanced-options,
   });
 
   detachParentDrop?.addEventListener('dragover', (event) => {
-    if (!draggedTask || !draggedTask.dataset.parentId) return;
+    if (dragIntent !== 'parent' || !draggedTask || !draggedTask.dataset.parentId) return;
     event.preventDefault();
     clearDropMarkers();
     clearDropIntent();
@@ -2619,7 +2645,7 @@ td, th, .score-choices label, .advanced-options,
   });
 
   detachParentDrop?.addEventListener('drop', async (event) => {
-    if (!draggedTask || !draggedTask.dataset.parentId) return;
+    if (dragIntent !== 'parent' || !draggedTask || !draggedTask.dataset.parentId) return;
     const sourceTask = draggedTask;
     event.preventDefault();
     event.stopPropagation();
@@ -2707,6 +2733,7 @@ h2 { margin:0; font-size:1.08rem; }
 .field-grid { display:grid; grid-template-columns:minmax(0,1fr) 170px 170px; gap:10px; }
 .field { display:grid; gap:6px; }
 .field-wide { grid-column:1 / -1; }
+.actions { display:flex; align-items:center; gap:8px; }
 label { color:#475467; font-size:.82rem; font-weight:700; }
 input,select,button { min-height:41px; padding:8px 10px; border:1px solid #cfd5df; border-radius:9px; font:inherit; }
 input,select { width:100%; color:var(--text); background:#fff; }
@@ -2826,19 +2853,64 @@ input, select, button { min-height:26px; padding:3px 10px; border-radius:0; }
 {% if not task['completed'] %}
 <section class="card">
   <div class="section-head">
+    <h2>タスクを編集</h2>
+    <p>詳細・子タスク・編集をこの画面にまとめています</p>
+  </div>
+  <form method="post" action="{{ url_for('edit_task', task_id=task['id']) }}">
+    <div class="field-grid">
+      <div class="field field-wide">
+        <label for="edit-title">タイトル</label>
+        <input id="edit-title" type="text" name="title" value="{{ task['title'] }}" autocomplete="off" required>
+      </div>
+      <div class="field">
+        <label for="edit-tag">タグ</label>
+        <select id="edit-tag" name="tag">
+          {% for tag in tags %}
+            <option value="{{ tag }}" {% if tag == task['tag'] %}selected{% endif %}>{{ tag }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="edit-score">基本点</label>
+        <select id="edit-score" name="score">
+          {% for score in [30,60,100] %}
+            <option value="{{ score }}" {% if score == task['base_score'] %}selected{% endif %}>{{ score }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="edit-due-date">期日</label>
+        <input id="edit-due-date" type="date" name="due_date" value="{{ task['due_date'] }}">
+      </div>
+      <div class="field">
+        <label for="edit-recur">繰り返し</label>
+        <select id="edit-recur" name="recur">
+          <option value="none" {% if task['recur'] == 'none' %}selected{% endif %}>なし</option>
+          <option value="weekly" {% if task['recur'] == 'weekly' %}selected{% endif %}>毎週</option>
+          <option value="monthly" {% if task['recur'] == 'monthly' %}selected{% endif %}>毎月</option>
+        </select>
+      </div>
+      <div class="field field-wide">
+        <label for="detail-parent">親タスク</label>
+        <select id="detail-parent" name="parent_id">
+          <option value="" {% if current_parent_id is none %}selected{% endif %}>なし</option>
+          {% for parent in parent_candidates %}
+            <option value="{{ parent['id'] }}" {% if current_parent_id == parent['id'] %}selected{% endif %}>{{ parent['title'] }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn-primary" type="submit">変更を保存</button>
+    </div>
+  </form>
+</section>
+
+<section class="card">
+  <div class="section-head">
     <h2>子タスクを追加</h2>
     <p>親タスクは「{{ task['title'] }}」に固定されます</p>
   </div>
-  <form class="parent-link-form" method="post" action="{{ url_for('set_task_parent', task_id=task['id']) }}">
-    <label for="detail-parent">このタスクの親</label>
-    <select id="detail-parent" name="parent_id">
-      <option value="" {% if current_parent_id is none %}selected{% endif %}>親なし</option>
-      {% for parent in parent_candidates %}
-        <option value="{{ parent['id'] }}" {% if current_parent_id == parent['id'] %}selected{% endif %}>{{ parent['title'] }}</option>
-      {% endfor %}
-    </select>
-    <button type="submit">親を更新</button>
-  </form>
   <form method="post" action="{{ url_for('add_child', task_id=task['id']) }}">
     <div class="field-grid">
       <div class="field field-wide">
@@ -3890,6 +3962,9 @@ def update_meta(task_id):
 
 @app.route('/edit/<int:task_id>', methods=['GET', 'POST'])
 def edit_task(task_id):
+    if request.method == 'GET':
+        return redirect(url_for('task_detail', task_id=task_id))
+
     tags = read_tags()
 
     with TASKS_LOCK:
@@ -3903,7 +3978,7 @@ def edit_task(task_id):
             break
 
     if (not task) or int(task.get('completed', 0)) == 1:
-        return redirect(url_for('index'))
+        return redirect(url_for('task_detail', task_id=task_id))
 
     active = [t for t in tasks if int(t.get('completed', 0)) == 0]
     active_ids = {str(t['id']) for t in active}
@@ -3992,15 +4067,9 @@ def edit_task(task_id):
         for bonus_task_id in bonus_task_ids:
             enqueue_task_sync(bonus_task_id)
 
-        return redirect(url_for('index'))
+        return redirect(url_for('task_detail', task_id=task_id))
 
-    return render_template_string(
-        EDIT_HTML,
-        task=task,
-        tags=tags,
-        parent_candidates=parent_candidates,
-        current_parent_id=current_parent_id
-    )
+    return redirect(url_for('task_detail', task_id=task_id))
 
 if __name__ == '__main__':
     ensure_files()
