@@ -44,19 +44,12 @@ GOOGLE_TOKEN_JSON = os.path.join(CRED_DIR, 'google_token.json')
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/tasks']
 CODEX_TASK_API_TOKEN = os.environ.get('CODEX_TASK_API_TOKEN', '').strip()
 
-def resolve_google_sync_enabled(setting, credentials_path):
-    normalized = (setting or 'auto').strip().lower()
-    if normalized in ('1', 'true', 'yes', 'on'):
-        return True
-    if normalized in ('0', 'false', 'no', 'off'):
-        return False
-    return os.path.exists(credentials_path)
+def google_sync_enabled_from_setting(setting):
+    return (setting or '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-GOOGLE_SYNC_SETTING = os.environ.get('GOOGLE_SYNC_ENABLED', 'auto')
-GOOGLE_SYNC_ENABLED = resolve_google_sync_enabled(
-    GOOGLE_SYNC_SETTING,
-    GOOGLE_CREDENTIALS_JSON
+GOOGLE_SYNC_ENABLED = google_sync_enabled_from_setting(
+    os.environ.get('GOOGLE_SYNC_ENABLED', '0')
 )
 
 VALID_SCORES = {30, 60, 100}
