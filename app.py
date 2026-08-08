@@ -15,6 +15,7 @@ import re
 import threading
 import queue
 import time
+from shared_data import SharedDataConflictError, SharedDataCoordinator
 
 
 
@@ -22,11 +23,15 @@ import time
 
 app = Flask(__name__)
 
-DATA_DIR = 'data'
-CRED_DIR = 'unupload'
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIGURED_DATA_DIR = os.environ.get('TASKLIST_DATA_DIR', '').strip()
+DATA_DIR = os.path.abspath(os.path.expanduser(CONFIGURED_DATA_DIR)) if CONFIGURED_DATA_DIR else os.path.join(APP_DIR, 'data')
+CRED_DIR = os.path.join(APP_DIR, 'unupload')
 TASKS_CSV = os.path.join(DATA_DIR, 'tasks.csv')
 TAGS_CSV = os.path.join(DATA_DIR, 'tags.csv')
 TAG_RULES_JSON = os.path.join(DATA_DIR, 'tag_rules.json')  # ← 追加
+SHARED_DATA_MODE = bool(CONFIGURED_DATA_DIR)
+SHARED_DATA_SENTINEL = os.path.join(DATA_DIR, '.tasklist-shared.json')
 
 TASK_FIELDS = [
     'id', 'title', 'tag', 'score', 'base_score',
@@ -51,11 +56,16 @@ def google_sync_enabled_from_setting(setting):
 GOOGLE_SYNC_ENABLED = google_sync_enabled_from_setting(
     os.environ.get('GOOGLE_SYNC_ENABLED', '0')
 )
+if SHARED_DATA_MODE:
+    # Google Drive共有とGoogle Tasks同期を同時に動かすと、
+    # 別系統からCSVが書き換わるため共有中は無効化する。
+    GOOGLE_SYNC_ENABLED = False
 
 VALID_SCORES = {30, 60, 100}
 VALID_RECURS = {'none', 'weekly', 'monthly'}
 
-TASKS_LOCK = threading.RLock()
+DATA_LOCK = threading.RLock()
+TASKS_LOCK = DATA_LOCK
 SYNC_QUEUE = queue.Queue()
 SYNC_WORKER_LOCK = threading.Lock()
 SYNC_STATE_LOCK = threading.Lock()
@@ -70,44 +80,102 @@ CHART_CACHE = {
     'png_bytes': None
 }
 
+SHARED_STORAGE = SharedDataCoordinator(DATA_DIR, enabled=SHARED_DATA_MODE)
+
 
 # ---------- 永続化 ----------
-def ensure_files():
-    if not os.path.isdir(DATA_DIR):
-        os.makedirs(DATA_DIR)
+def validate_shared_csv(path, required_headers):
+    try:
+        with open(path, 'r', newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f, strict=True)
+            header = next(reader, None)
+            if not header:
+                raise RuntimeError(f'共有CSVのヘッダーがありません: {path}')
+            missing = sorted(set(required_headers) - set(header))
+            if missing:
+                raise RuntimeError(
+                    f'共有CSVの必須列がありません ({", ".join(missing)}): {path}'
+                )
+            for row_number, row in enumerate(reader, start=2):
+                if len(row) != len(header):
+                    raise RuntimeError(
+                        f'共有CSVの{row_number}行目が壊れています: {path}'
+                    )
+    except (OSError, csv.Error) as exc:
+        raise RuntimeError(f'共有CSVを安全に読み取れません: {path}') from exc
+
+
+def _ensure_files():
+    if SHARED_DATA_MODE:
+        SHARED_STORAGE.validate_data_directory()
+        missing = [
+            path for path in (TASKS_CSV, TAGS_CSV)
+            if not os.path.isfile(path)
+        ]
+        if missing:
+            raise RuntimeError(
+                'Google Drive共有データが未同期です: '
+                + ', '.join(missing)
+            )
+        validate_shared_csv(
+            TASKS_CSV,
+            {'id', 'title', 'tag', 'score', 'completed', 'due_date'}
+        )
+        validate_shared_csv(TAGS_CSV, {'tag'})
+        return
+
+    os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(TAGS_CSV):
-        with open(TAGS_CSV, 'w', newline='', encoding='utf-8') as f:
+        def write_initial_tags(f):
             w = csv.writer(f)
             w.writerow(['tag'])
             w.writerow(['マイタスク'])
+        SHARED_STORAGE.atomic_write_data_file(
+            TAGS_CSV,
+            write_initial_tags,
+            create_backup=False
+        )
     if not os.path.exists(TASKS_CSV):
-        with open(TASKS_CSV, 'w', newline='', encoding='utf-8') as f:
+        def write_initial_tasks(f):
             w = csv.DictWriter(f, fieldnames=TASK_FIELDS)
             w.writeheader()
+        SHARED_STORAGE.atomic_write_data_file(
+            TASKS_CSV,
+            write_initial_tasks,
+            create_backup=False
+        )
+
+
+def ensure_files():
+    with DATA_LOCK:
+        _ensure_files()
 
 def read_tags():
-    ensure_files()
-    tags = []
-    with open(TAGS_CSV, 'r', newline='', encoding='utf-8') as f:
-        r = csv.DictReader(f)
-        for row in r:
-            tags.append(row['tag'])
-    if 'マイタスク' not in tags:
-        tags.insert(0, 'マイタスク')
-        write_tags(tags)
-    return tags
+    with TASKS_LOCK:
+        ensure_files()
+        tags = []
+        with open(TAGS_CSV, 'r', newline='', encoding='utf-8-sig') as f:
+            r = csv.DictReader(f)
+            for row in r:
+                tags.append(row['tag'])
+        if 'マイタスク' not in tags:
+            tags.insert(0, 'マイタスク')
+            write_tags(tags)
+        return tags
 
 def write_tags(tags):
-    with open(TAGS_CSV, 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        w.writerow(['tag'])
-        for t in tags:
-            w.writerow([t])
+    with TASKS_LOCK:
+        def write_file(f):
+            w = csv.writer(f)
+            w.writerow(['tag'])
+            for t in tags:
+                w.writerow([t])
+        SHARED_STORAGE.atomic_write_data_file(TAGS_CSV, write_file)
 
 def read_tasks():
     ensure_files()
     tasks = []
-    with open(TASKS_CSV, 'r', newline='', encoding='utf-8') as f:
+    with open(TASKS_CSV, 'r', newline='', encoding='utf-8-sig') as f:
         r = csv.DictReader(f)
         for row in r:
             task_id = to_int(row.get('id'), 0)
@@ -170,7 +238,7 @@ def read_tasks():
     return tasks
 
 def write_tasks(tasks):
-    with open(TASKS_CSV, 'w', newline='', encoding='utf-8') as f:
+    def write_file(f):
         w = csv.DictWriter(f, fieldnames=TASK_FIELDS)
         w.writeheader()
         for t in tasks:
@@ -191,6 +259,7 @@ def write_tasks(tasks):
                 'google_task_id': t.get('google_task_id', ''),
                 'sync_pending': t.get('sync_pending', 0)
             })
+    SHARED_STORAGE.atomic_write_data_file(TASKS_CSV, write_file)
 def next_task_id(tasks):
     return (max([t['id'] for t in tasks]) + 1) if tasks else 1
 
@@ -293,8 +362,11 @@ def auto_tag(title, current_tag, tags):
             if normalize_text(kw) in norm_title:
                 # タグが未定義なら追加
                 if tag_name not in tags:
-                    tags.append(tag_name)
-                    write_tags(tags)
+                    with TASKS_LOCK:
+                        latest_tags = read_tags()
+                        if tag_name not in latest_tags:
+                            latest_tags.append(tag_name)
+                            write_tags(latest_tags)
                 return tag_name
 
     return current_tag or 'マイタスク'
@@ -1557,6 +1629,7 @@ li.task-date-gap {
   border-radius: 10px;
   cursor: pointer;
 }
+
 .task-row:active { cursor: pointer; }
 .task-row:hover {
   border-color: var(--line);
@@ -3286,9 +3359,8 @@ def create_local_task(title, tag='マイタスク', score=30, due_date=None,
     due_date = sanitize_due_date(due_date or today_str())
     recur = sanitize_recur(recur or 'none')
     parent_id = sanitize_parent_id(str(parent_id) if parent_id is not None else '')
-    tag = auto_tag(title, tag, read_tags())
-
     with TASKS_LOCK:
+        tag = auto_tag(title, tag, read_tags())
         tasks = read_tasks()
         tid = next_task_id(tasks)
         sort_order = first_sibling_sort_order(tasks, parent_id, due_date)
@@ -3410,6 +3482,12 @@ def reopen_local_task(task_id):
 
 @app.before_request
 def ensure_background_sync():
+    if SHARED_DATA_MODE:
+        conflicts = SHARED_STORAGE.ensure_session()
+        if conflicts and request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            raise SharedDataConflictError(
+                SHARED_STORAGE.conflict_message(conflicts)
+            )
     if request.path == '/api/codex' or request.path.startswith('/api/codex/'):
         denied = codex_api_guard_response()
         if denied:
@@ -3417,9 +3495,22 @@ def ensure_background_sync():
     start_sync_worker()
 
 
+@app.errorhandler(SharedDataConflictError)
+def shared_data_conflict(error):
+    if request.path == '/api/codex' or request.path.startswith('/api/codex/'):
+        return jsonify({'ok': False, 'error': str(error)}), 423
+    return Response(str(error), status=423, mimetype='text/plain')
+
+
 @app.route('/api/codex/health')
 def codex_api_health():
-    return jsonify({'ok': True, 'service': 'tasklist', 'version': 1})
+    return jsonify({
+        'ok': True,
+        'service': 'tasklist',
+        'version': 1,
+        'shared_data': SHARED_DATA_MODE,
+        'device_id': SHARED_STORAGE.device_id if SHARED_DATA_MODE else ''
+    })
 
 
 @app.route('/api/codex/tasks')
@@ -3867,23 +3958,23 @@ def tags_page():
 def add_tag():
     new_tag = request.form.get('new_tag', '').strip()
     if new_tag:
-        tags = read_tags()
-        if new_tag not in tags:
-            tags.append(new_tag)
-            write_tags(tags)
+        with TASKS_LOCK:
+            tags = read_tags()
+            if new_tag not in tags:
+                tags.append(new_tag)
+                write_tags(tags)
     return redirect(url_for('tags_page'))
 
 @app.route('/tags/delete', methods=['POST'])
 def delete_tag():
     tag = request.form.get('tag', '')
     if tag and tag != 'マイタスク':
-        tags = read_tags()
-        tags = [t for t in tags if t != tag]
-        if 'マイタスク' not in tags:
-            tags.insert(0, 'マイタスク')
-        write_tags(tags)
-        # 紐づくタスクは「マイタスク」へ移行
         with TASKS_LOCK:
+            tags = read_tags()
+            tags = [t for t in tags if t != tag]
+            if 'マイタスク' not in tags:
+                tags.insert(0, 'マイタスク')
+            # 紐づくタスクは「マイタスク」へ移行
             tasks = read_tasks()
             changed = False
             for t in tasks:
@@ -3892,6 +3983,7 @@ def delete_tag():
                     changed = True
             if changed:
                 write_tasks(tasks)
+            write_tags(tags)
     return redirect(url_for('tags_page'))
 
 
@@ -3900,15 +3992,12 @@ def update_meta(task_id):
     new_tag = (request.form.get('tag') or 'マイタスク').strip() or 'マイタスク'
     new_parent_id = (request.form.get('parent_id') or '').strip()
 
-    tags = read_tags()
-
-    if new_tag not in tags:
-        new_tag = 'マイタスク'
-
     updated = False
     bonus_task_ids = []
 
     with TASKS_LOCK:
+        if new_tag not in read_tags():
+            new_tag = 'マイタスク'
         tasks = read_tasks()
 
         active = [t for t in tasks if t['completed'] == 0]
@@ -3965,8 +4054,6 @@ def edit_task(task_id):
     if request.method == 'GET':
         return redirect(url_for('task_detail', task_id=task_id))
 
-    tags = read_tags()
-
     with TASKS_LOCK:
         tasks = read_tasks()
         annotate_effective_scores(tasks)
@@ -4017,8 +4104,6 @@ def edit_task(task_id):
             new_title = task['title']
 
         new_tag = (request.form.get('tag') or 'マイタスク').strip() or 'マイタスク'
-        if new_tag not in tags:
-            new_tag = 'マイタスク'
 
         new_base_score = sanitize_score(
             request.form.get('score'),
@@ -4038,6 +4123,8 @@ def edit_task(task_id):
 
         bonus_task_ids = []
         with TASKS_LOCK:
+            if new_tag not in read_tags():
+                new_tag = 'マイタスク'
             tasks = read_tasks()
             for current in tasks:
                 if current['id'] == task_id:

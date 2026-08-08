@@ -1,17 +1,9 @@
 @echo off
+chcp 65001 >nul
+setlocal
+cd /d "%~dp0"
 
-REM ====== 設定 ======
-set CONDA_ENV=taskenv
-set SCRIPT_PATH=C:\Users\canmi\Documents\GitHub\tasklist\tasklist\app.py
-REM ===================
-
-REM conda 初期化
-call "%USERPROFILE%\anaconda3\Scripts\activate.bat"
-
-REM 環境を有効化
-call conda activate %CONDA_ENV%
-
-REM スクリプト実行
-python "%SCRIPT_PATH%"
-
-pause
+REM 通常起動はGoogle Drive共有版に固定する。
+REM Driveが未接続なら共有版の起動スクリプトが安全に中止する。
+call "%~dp0start_with_google_drive.bat" %*
+exit /b %errorlevel%
